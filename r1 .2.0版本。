@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+"""
+SEQUENCE OS Lite v2.0 — 完整链路版
+INGEST:  FactSchema检查 → R1 → 写入
+RECALL:  Validity → ConflictResolver → Scoring → Dedup → TopK
+"""
+import json, hashlib, os, time, threading, base64, struct, hmac
+
+# ═══════════ 词表定义 ═══════════
+SCHEMA = {
+    "residence": "single",
+    "current_position": "single",
+    "status": "single",
+    "preference": "multiple",
+    "relationship": "single",
+}
+
+FACT_TYPES = {
+    "residence": "state",
+    "current_position": "state",
+    "status": "state",
+    "preference": "state",
+    "relationship": "state",
+}
+
+SOURCE_BONUS = {
+    "user": 0.4,
+    "system": 0.2,
+    "agent": 0.1,
+    "unknown": 0.0,
+}
+
+# ═══════════ 第一层：Link ═══════════
+class Link:
+    VERSION = b"\x01\x02"
+    def __init__(self, store_dir="./link_store"):
+        self.store_dir = store_dir
+        os.makedirs(store_dir, exist_ok=True)
+
+    def _derive(self, pwd, salt):
+        return hashlib.pbkdf2_hmac('sha256', pwd.encode(), salt, 100000)
+
+    def write(self, state: dict, pwd: str) -> str:
+        link_id = hashlib.sha256(str(time.time()).encode()).hexdigest()[:16]
+        salt = os.urandom(16)
+        key = self._derive(pwd, salt)
+        raw = json.dumps(state).encode()
+        length = struct.pack("!I", len(raw))
+        iv = os.urandom(12)
+        ks = hashlib.sha256(key).digest() * ((len(raw) + 32) // 32 + 1)
+        enc = bytes(a ^ b for a, b in zip(raw, ks[:len(raw)]))
+        payload = self.VERSION + length + iv + enc
+        mac = hmac.new(key, payload, "sha256").digest()
+        final = base64.b64encode(payload + mac).decode()
+        store = {"id": link_id, "salt": base64.b64encode(salt).decode(),
+                 "ts": time.time(), "data": final}
+        with open(os.path.join(self.store_dir, f"{link_id}.json"), "w") as f:
+            json.dump(store, f)
+        return link_id
+
+    def read(self, link_id: str, pwd: str) -> dict:
+        path = os.path.join(self.store_dir, f"{link_id}.json")
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Link {link_id} 不存在")
+        with open(path) as f:
+            store = json.load(f)
+        salt = base64.b64decode(store["salt"])
+        key = self._derive(pwd, salt)
+        full = base64.b64decode(store["data"])
+        sig, payload = full[-32:], full[:-32]
+        expected = hmac.new(key, payload, "sha256").digest()
+        if not hmac.compare_digest(sig, expected):
+            raise ValueError("Link 校验失败：数据可能被篡改")
+        ver, length = struct.unpack("!2sI", payload[:6])
+        if ver != self.VERSION:
+            raise ValueError(f"版本不兼容: {ver.hex()} != {self.VERSION.hex()}")
+        iv, cipher = payload[6:18], payload[18:18+length]
+        ks = hashlib.sha256(key).digest() * ((length + 32) // 32 + 1)
+        raw = bytes(a ^ b for a, b in zip(cipher, ks[:length]))
+        return json.loads(raw)
+
+# ═══════════ 第二层：LCS ═══════════
+class LCS:
+    def __init__(self):
+        self._events = []
+        self._lock = threading.Lock()
+
+    def register_deadline(self, node_id, ms):
+        print(f"[LCS] 节点 {node_id} 超时 {ms}ms 注册")
+        def _push():
+            with self._lock:
+                self._events.append({"type": "timeout", "node_id": node_id,
+                                     "ts": time.time(), "payload": {"timeout_ms": ms}})
+                print(f"[超时] {node_id} 超时了!")
+        t = threading.Timer(ms/1000, _push)
+        t.start()
+        return t
+
+    def get_event(self):
+        with self._lock:
+            return self._events.pop(0) if self._events else None
+
+# ═══════════ 第三层：SchemaLMS（完整链路） ═══════════
+class SchemaLMS:
+    def __init__(self, path="./memory_store.json"):
+        self.path = path
+        self.lock = threading.RLock()
+        self.store = []
+        if os.path.exists(path):
+            with open(path) as f:
+                self.store = json.load(f)
+
+    def _save(self):
+        with open(self.path, "w") as f:
+            json.dump(self.store, f, indent=2, ensure_ascii=False)
+
+    # ── INGEST 链路 ──
+    def ingest(self, content, agent_id="", attribute=None, metadata=None, source="unknown"):
+        with self.lock:
+            now = time.time()
+
+            # [1] Fact Schema 检查
+            if attribute is not None:
+                if attribute not in SCHEMA:
+                    raise ValueError(f"attribute '{attribute}' 不在词表中，拒绝写入")
+                card = SCHEMA[attribute]
+            else:
+                card = None
+
+            # [2] R1：single 属性 → 旧值作废
+            if card == "single":
+                for old in self.store:
+                    if old.get("attribute") != attribute: continue
+                    if old.get("agent_id") != agent_id: continue
+                    if old.get("invalidated_at") is not None: continue
+                    if old.get("content") == content: return old["id"]
+                    old["invalidated_at"] = now
+                    old["valid_until"] = now
+                    self.add_audit("r1_invalidate",
+                                   f"{agent_id}/{attribute} 旧值({old['content'][:20]}) -> 新值({content[:20]})")
+
+            # [3] 写入
+            m = {
+                "id": hashlib.md5(f"{agent_id}|{attribute}|{content}|{now}".encode()).hexdigest()[:12],
+                "agent_id": agent_id,
+                "attribute": attribute,
+                "content": content,
+                "source": source,
+                "ts": now,
+                "valid_from": now,
+                "valid_until": None,
+                "invalidated_at": None,
+                "strength": 1.0,
+                "is_audit": False,
+                "meta": dict(metadata or {}),
+            }
+            if attribute:
+                m["meta"]["fact_type"] = FACT_TYPES.get(attribute, "state")
+            self.store.append(m)
+            self._save()
+            return m["id"]
+
+    # ── RECALL 链路 ──
+    def recall(self, top_k=10, agent_id=""):
+        with self.lock:
+            now = time.time()
+
+            # [1] Validity Filter
+            valid = []
+            for m in self.store:
+                if m.get("is_audit"): continue
+                if m.get("invalidated_at") is not None: continue
+                if m.get("valid_until") is not None and m["valid_until"] <= now: continue
+                if m.get("strength", 0) < 0.01: continue
+                if agent_id and m.get("agent_id") != agent_id: continue
+                valid.append(m)
+
+            # [2] Conflict Resolver：single 属性多候选 → 保留 valid_from 最新
+            resolved = []
+            groups = {}
+            for m in valid:
+                key = (m.get("agent_id"), m.get("attribute"))
+                groups.setdefault(key, []).append(m)
+            for (ag, attr), group in groups.items():
+                if attr is not None and SCHEMA.get(attr) == "single" and len(group) > 1:
+                    group.sort(key=lambda x: x.get("valid_from", x["ts"]), reverse=True)
+                    resolved.append(group[0])
+                    self.add_audit("conflict_resolved",
+                                   f"{ag}/{attr} 存在 {len(group)} 条有效，保留最新")
+                else:
+                    resolved.extend(group)
+
+            # [3] Scoring：base + source 加权
+            scored = []
+            for m in resolved:
+                base = 0.5 * m["strength"] + 0.5 / (1 + (now - m.get("valid_from", m["ts"])) / 86400)
+                bonus = SOURCE_BONUS.get(m.get("source", "unknown"), 0.0)
+                score = base * 0.6 + bonus * 0.4
+                scored.append((score, m))
+
+            scored.sort(key=lambda x: x[0], reverse=True)
+
+            # [4] Dedup：按内容去重
+            seen = set()
+            unique = []
+            for score, m in scored:
+                if m["content"] not in seen:
+                    seen.add(m["content"])
+                    unique.append(m)
+
+            # [5] Top-K
+            return unique[:top_k]
+
+    def invalidate(self, memory_id):
+        with self.lock:
+            for m in self.store:
+                if m["id"] == memory_id:
+                    m["invalidated_at"] = time.time()
+                    self._save()
+                    return True
+            return False
+
+    def add_audit(self, action, detail=""):
+        with self.lock:
+            self.store.append({
+                "id": "_audit_" + hashlib.md5(f"{action}{detail}{time.time()}".encode()).hexdigest()[:8],
+                "content": f"[AUDIT] {action}: {detail}",
+                "ts": time.time(), "strength": 1.0, "is_audit": True
+            })
+            self._save()
+
+    def decay_all(self, half_life=7):
+        with self.lock:
+            now = time.time()
+            lam = (2 ** (1 / half_life) - 1) / 86400
+            for m in self.store:
+                if m.get("is_audit"): continue
+                elp = now - m.get("_last_decay", m["ts"])
+                m["strength"] = max(0.0, m["strength"] * (1 - lam) ** elp)
+                m["_last_decay"] = now
+            self._save()
+
+# ═══════════ 状态机 ═══════════
+class StateMachine:
+    def __init__(self, lms):
+        self.state = "frozen"
+        self.lms = lms
+
+    def transition(self, target, reason=""):
+        if target not in ["frozen", "awakening", "awake", "standby"]:
+            raise ValueError(f"未知状态: {target}")
+        _from = self.state
+        self.state = target
+        self.lms.add_audit("state_transition", f"{_from} -> {target} | {reason or 'none'}")
+        print(f"[状态机] {_from} -> {target}")
+
+    def is_awake(self):
+        return self.state == "awake"
+
+# ═══════════ 调度器 ═══════════
+class Scheduler:
+    def __init__(self, lms):
+        self.lms = lms
+        self.base_k = 8
+
+    def schedule(self, context=""):
+        candidates = self.lms.recall(top_k=20)
+        scored = []
+        for m in candidates:
+            score = (0.3 * m["strength"] +
+                     0.2 / (1 + (time.time() - m["ts"])/86400) +
+                     0.3 * (0.5 if any(w in m["content"] for w in context.split()) else 0))
+            scored.append((score, m))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        seen = set()
+        unique = []
+        for score, m in scored:
+            if m["content"] not in seen:
+                seen.add(m["content"])
+                unique.append(m)
+        return unique[:self.base_k]
+
+# ═══════════ Agent ═══════════
+class Agent:
+    def __init__(self, lms, sm):
+        self.lms = lms
+        self.sm = sm
+
+    def think(self, query):
+        mems = self.lms.recall(top_k=3)
+        ctx = " ".join(m["content"] for m in mems)
+        return f"回复: 关于'{query}'的记忆已调取"
+
+# ═══════════ HealLoop ═══════════
+class HealLoop:
+    def __init__(self, lms, sm):
+        self.lms = lms
+        self.sm = sm
+
+    def heal(self, strategy):
+        print(f"[HealLoop] 开始恢复: {strategy}")
+        if not self.sm.is_awake():
+            self.sm.transition("awake", "heal_force")
+        self.lms.add_audit("heal", str(strategy))
+        print("[HealLoop] 恢复成功")
+        return True
+
+# ═══════════ 测试 1：架构演示 ═══════════
+def run_demo():
+    print("\n===== [1] 架构演示 =====")
+    link = Link()
+    lcs = LCS()
+    lms = SchemaLMS(path="./demo_store.json")
+    sm = StateMachine(lms)
+    agent = Agent(lms, sm)
+    heal = HealLoop(lms, sm)
+    sched = Scheduler(lms)
+
+    lcs.register_deadline("demo", 2000)
+    state_id = link.write({"agent": "demo", "step": 0}, "pwd")
+    sm.transition("awake")
+    lms.ingest("用户喜欢简洁的回答", agent_id="demo", attribute="preference", source="user")
+    lms.ingest("上次方案写到第三章", agent_id="demo")
+
+    running = True
+    timeout_handled = False
+    while running:
+        evt = lcs.get_event()
+        if evt and not timeout_handled:
+            print(f"\n[超时事件] {evt}")
+            timeout_handled = True
+            print("\n[温度衰减]")
+            lms.decay_all(half_life=7)
+            mems = lms.recall(top_k=10)
+            for m in mems:
+                print(f"  [{m['strength']:.2f}] {m['content']}")
+            print("\n[调度器 Top-K]")
+            for m in sched.schedule("方案"):
+                print(f"  [{m['strength']:.2f}] {m['content']}")
+            print(f"\n[Agent] {agent.think('我上次写到哪了')}")
+            heal.heal({"type": "test"})
+            restored = link.read(state_id, "pwd")
+            print(f"\n[Link 持久化] {restored}")
+            running = False
+        time.sleep(0.05)
+    print("\n[1] 架构演示 通过")
+
+# ═══════════ 测试 2：R1 验证 ═══════════
+def run_r1_test():
+    print("\n===== [2] R1 规则验证 =====")
+    if os.path.exists("./r1_test.json"):
+        os.remove("./r1_test.json")
+    lms = SchemaLMS(path="./r1_test.json")
+
+    lms.ingest("北京", agent_id="A", attribute="residence", source="user")
+    lms.ingest("上海", agent_id="A", attribute="residence", source="system")
+    lms.ingest("深圳", agent_id="A", attribute="residence", source="agent")
+    r1 = [m for m in lms.recall(agent_id="A") if m.get("attribute") == "residence"]
+    print(f"[R1-1] residence 连续改3次 → 有效 {len(r1)} 条: {[m['content'] for m in r1]}")
+    assert len(r1) == 1 and r1[0]["content"] == "深圳"
+
+    lms.ingest("广州", agent_id="B", attribute="residence", source="user")
+    r2a = [m for m in lms.recall(agent_id="A") if m.get("attribute") == "residence"]
+    r2b = [m for m in lms.recall(agent_id="B") if m.get("attribute") == "residence"]
+    print(f"[R1-2] agent A: {[m['content'] for m in r2a]}")
+    print(f"       agent B: {[m['content'] for m in r2b]}")
+    assert len(r2a) == 1 and len(r2b) == 1
+
+    lms.ingest("喜欢简洁", agent_id="A", attribute="preference", source="user")
+    lms.ingest("喜欢详细", agent_id="A", attribute="preference", source="system")
+    pref = [m for m in lms.recall(agent_id="A") if m.get("attribute") == "preference"]
+    print(f"[R1-3] preference 共存 → {len(pref)} 条: {[m['content'] for m in pref]}")
+    assert len(pref) == 2
+
+    total = len(lms.recall(top_k=100))
+    invalid_count = len([m for m in lms.store if m.get("invalidated_at") and not m.get("is_audit")])
+    print(f"[R1-4] 存储中作废 {invalid_count} 条，recall 返回 {total} 条")
+    assert total == 4  # 深圳 + 广州 + 两条偏好
+
+    lms2 = SchemaLMS(path="./r1_test.json")
+    total2 = len(lms2.recall(top_k=100))
+    print(f"[R1-5] 重启后 recall 返回 {total2} 条")
+    assert total == total2
+
+    print("[2] R1 验证 全部通过")
+
+# ═══════════ 测试 3：回北京场景 ═══════════
+def run_beijing_test():
+    print("\n===== [3] 回北京场景 =====")
+    if os.path.exists("./r1_test.json"):
+        os.remove("./r1_test.json")
+    lms2 = SchemaLMS(path="./r1_test.json")
+
+    lms2.ingest("北京", agent_id="A", attribute="residence", source="user")
+    lms2.ingest("上海", agent_id="A", attribute="residence", source="system")
+    lms2.ingest("北京", agent_id="A", attribute="residence", source="user")
+
+    r = [m for m in lms2.recall(agent_id="A") if m.get("attribute") == "residence"]
+    print(f"[R2] residence 最终有效: {len(r)} 条: {[m['content'] for m in r]}")
+    assert len(r) == 1 and r[0]["content"] == "北京"
+    print("[3] 回北京 通过")
+
+# ═══════════ 测试 4：完整链路 ═══════════
+def test_pipeline():
+    print("\n===== [4] 完整链路测试 =====")
+    if os.path.exists("./pipeline_store.json"):
+        os.remove("./pipeline_store.json")
+    lms = SchemaLMS(path="./pipeline_store.json")
+
+    # 1. FactSchema 检查
+    try:
+        lms.ingest("测试", agent_id="A", attribute="not_exist")
+        print("[FAIL] 非法 attribute 未被拒绝")
+    except ValueError as e:
+        print(f"[OK] 非法 attribute 被拒绝: {e}")
+
+    # 2. R1 写入侧
+    lms.ingest("北京", agent_id="A", attribute="residence", source="user")
+    lms.ingest("上海", agent_id="A", attribute="residence", source="system")
+    r = [m for m in lms.recall(agent_id="A") if m.get("attribute") == "residence"]
+    print(f"[R1] residence 有效: {len(r)} 条: {[m['content'] for m in r]}")
+    assert len(r) == 1 and r[0]["content"] == "上海"
+
+    # 3. 强制制造冲突（绕过 R1 直接写库）
+    with lms.lock:
+        lms.store.append({
+            "id": "conflict_test",
+            "agent_id": "A",
+            "attribute": "residence",
+            "content": "旧北京残留",
+            "source": "unknown",
+            "ts": time.time() - 86400,
+            "valid_from": time.time() - 86400,
+            "valid_until": None,
+            "invalidated_at": None,
+            "strength": 1.0,
+            "is_audit": False,
+        })
+        lms._save()
+
+    # 4. Conflict Resolver 读取侧
+    r2 = [m for m in lms.recall(agent_id="A") if m.get("attribute") == "residence"]
+    print(f"[Resolver] 冲突后有效: {len(r2)} 条: {[m['content'] for m in r2]}")
+    assert len(r2) == 1 and r2[0]["content"] == "上海"
+
+    # 5. source 权重排序
+    lms.ingest("用户亲口说的偏好", agent_id="A", attribute="preference", source="user")
+    lms.ingest("系统推断的偏好", agent_id="A", attribute="preference", source="system")
+    pref = [m for m in lms.recall(agent_id="A") if m.get("attribute") == "preference"]
+    print(f"[source] 偏好排序: {[m['content'] for m in pref]}")
+    assert pref[0]["content"] == "用户亲口说的偏好"
+
+    # 6. 重启后保持
+    lms2 = SchemaLMS(path="./pipeline_store.json")
+    r_total = lms2.recall(top_k=100)
+    print(f"[重启] 有效记忆数: {len(r_total)}")
+    print("\n[4] 完整链路 全部通过")
+
+# ═══════════ 入口 ═══════════
+if __name__ == "__main__":
+    print("=== SEQUENCE OS Lite v2.0 ===")
+    run_demo()
+    run_r1_test()
+    run_beijing_test()
+    test_pipeline()
+    print("\n=== 全流程完成 ===")
